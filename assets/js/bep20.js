@@ -10,6 +10,7 @@ class CryptoPaymentBEP20 {
     this.address = null;
     this.provider = null;
     this.signer = null;
+    this.lastError = "";
   }
 
   getInjected() {
@@ -126,7 +127,7 @@ class CryptoPaymentBEP20 {
       this.signer
     );
 
-    const tx = await contract.transfer(to, smallestUnit);
+    const tx = await contract.transfer(to, smallestUnit.toString());
 
     // Wait for one confirmation so the order endpoint sees the tx
     const receipt = await tx.wait();
