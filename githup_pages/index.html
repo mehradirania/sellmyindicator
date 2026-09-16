@@ -1,101 +1,27 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-
-    <title>CryptoDirect – Crypto Store</title>
-    <meta name="description" content="Crypto Payment Store - Pay with USDT TRC20">
-
-    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🪙</text></svg>">
-
-    <link rel="stylesheet" href="assets/css/style.css">
-
-    <!-- Configuration -->
-    <script src="assets/js/config.js"></script>
-
-    <!-- Buffer polyfill (dist/ path of this package does not exist — use +esm) -->
-    <script type="module">
-        import bufferPolyfill from "https://cdn.jsdelivr.net/npm/buffer-polyfill@6.0.3/+esm";
-        window.Buffer = window.Buffer || bufferPolyfill;
-    </script>
-
-    <!-- WalletConnect sign client -->
-    <script src="https://cdn.jsdelivr.net/npm/@walletconnect/sign-client@2.23.4/dist/index.umd.js"></script>
-
-    <!-- The tronwallet-adapters UMD reads its dependency from
-         window["@walletconnect/sign-client"], but the sign-client UMD exposes
-         window.SignClient — bridge it BEFORE the adapters script runs. -->
-    <script>
-        window["@walletconnect/sign-client"] = window.SignClient;
-    </script>
-
-    <!-- TRON wallet adapters (UMD global: window["@tronweb3/tronwallet-adapters"]) -->
-    <script src="https://cdn.jsdelivr.net/npm/@tronweb3/tronwallet-adapters@1.3.3/lib/umd/index.js"></script>
-
-    <!-- TronWeb (v6 has no dist/TronWeb.js — v5 UMD defines window.TronWeb) -->
-    <script src="https://cdn.jsdelivr.net/npm/tronweb@5.3.0/dist/TronWeb.js"></script>
-
-    <!-- ethers (BEP20 / EVM wallets) -->
-    <script src="https://cdn.jsdelivr.net/npm/ethers@5.7.2/dist/ethers.umd.min.js"></script>
-
-    <!-- CryptoDirect -->
-    <script src="assets/js/payment.js"></script>
-    <script src="assets/js/bep20.js"></script>
-    <script src="assets/js/app.js"></script>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CryptoDirect – Crypto Store</title>
+<meta name="description" content="Crypto payment store for digital products.">
+<link rel="stylesheet" href="../assets/css/style.css?v=10">
+<script>window.API_BASE_URL = ''; </script>
+<script src="https://cdn.jsdelivr.net/npm/@walletconnect/sign-client@2.23.4/dist/index.umd.js"></script>
+<script>window["@walletconnect/sign-client"]=window.SignClient;</script>
+<script src="https://cdn.jsdelivr.net/npm/@tronweb3/tronwallet-adapters@1.3.3/lib/umd/index.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/tronweb@5.3.0/dist/TronWeb.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/ethers@5.7.2/dist/ethers.umd.min.js"></script>
+<script src="../assets/js/config.js?v=10"></script>
+<script src="../assets/js/utils.js?v=10"></script>
+<script src="../assets/js/payment.js?v=10"></script>
+<script src="../assets/js/bep20.js?v=10"></script>
+<script src="../assets/js/app.js?v=10"></script>
 </head>
-
-<body>
-
-    <div class="header">
-        <h1>🪙 CryptoDirect</h1>
-        <p>Crypto Payment Store - Pay with USDT TRC20</p>
-    </div>
-
-    <div class="wallet-status" id="walletStatus">
-        <div class="wallet-info">
-            <span class="wallet-dot disconnected" id="walletDot"></span>
-            <span id="walletText">Wallet not connected</span>
-        </div>
-
-        <button
-            class="connect-wallet-btn"
-            id="connectWalletBtn"
-            type="button"
-        >
-            Connect Wallet
-        </button>
-    </div>
-
-    <div id="warningContainer"></div>
-
-    <div class="products-container" id="productsContainer">
-        <div class="loading">Loading products...</div>
-    </div>
-
-    <div class="modal" id="paymentModal">
-
-        <div class="modal-content">
-
-            <div class="modal-header">
-                <button
-                    class="modal-close"
-                    id="closeModal"
-                    type="button"
-                >
-                    &times;
-                </button>
-
-                <div class="modal-title" id="modalTitle">
-                    Product Details
-                </div>
-            </div>
-
-            <div class="modal-body" id="modalBody"></div>
-
-        </div>
-
-    </div>
-
-</body>
-</html>
+<body data-api-base="../api">
+<script id="productsData" type="application/json">[{"id":"A7kD9sBfP2LmQxT4V","name":"PST Trend Indicator","description":"The best trend-detection indicator in the world, built on Mehrad Irani's eleven years of professional experience in Forex and Cryptocurrency markets. PST analyzes every layer of the market using a multi-timeframe matrix and shows you exactly why its analysis is trustworthy.\n\nWith real-time entry and exit lines displayed directly on the chart, PST gives you the confidence to enter trades with zero hesitation.\n\nAdditionally, by following a strict 1:2 risk-to-reward ratio, PST protects your capital automatically. You only set your account usage, and PST handles the analysis and risk management for you.\n\nThis is the ultimate indicator for traders who want accuracy, confidence, and professional-level risk control.","price":299,"image":"https://f001.backblazeb2.com/file/omnicoder-public/production/projects/19200_07fce73b54386f7aecc738c5e1a6fbcf4e6e88ef9304f6c5b84f1f6ae6f8348a/154243/IMG_20260621_174250_857.jpg","file":"https://www.dropbox.com/scl/fo/lccpf7saii8ynchui9r8x/AOnz6Th0xNLpeiF3goca09A?rlkey=olpr9mmnxfftscygt3iuuv372&st=nuxealqn&dl=0","wallet":"TN9sBCbSbd4LSmEa9xJfTJJLVLWFyo4p4Y","created_at":1726200000}]</script>
+<header class="header"><h1>🪙 CryptoDirect</h1><p>Crypto Payment Store</p></header>
+<div class="wallet-status" id="walletStatus"><div class="wallet-info"><span class="wallet-dot disconnected" id="walletDot"></span><span id="walletText">Wallet not connected</span></div><button class="connect-wallet-btn" id="connectWalletBtn" type="button">Connect Wallet</button></div>
+<div id="warningContainer"></div>
+<main class="products-container" id="productsContainer"></main>
+<div class="modal" id="paymentModal" aria-hidden="true"><div class="modal-content" role="dialog" aria-modal="true"><div class="modal-header"><button class="modal-close" id="closeModal" type="button" aria-label="Close">&times;</button><div class="modal-title" id="modalTitle">Product Details</div></div><div class="modal-body" id="modalBody"></div></div></div>
+</body></html>
