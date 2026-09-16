@@ -1,376 +1,238 @@
 <?php
-/**
- * CryptoDirect — order endpoint
- *
- * Receives a payment report from the browser after an on-chain USDT transfer,
- * re-verifies the transaction server-side (TRC20 via TronGrid, BEP20 via a
- * public BSC RPC), records it idempotently, and releases the download link.
- *
- * Policy: a payment that CANNOT be found on-chain is rejected; a payment whose
- * verification is skipped only because the explorer RPC is unreachable is
- * accepted and logged as unverified.
- */
-
 declare(strict_types=1);
-
 require_once __DIR__ . '/../includes/db.php';
 
-// Recipient / contract constants (mirror of the client config.js)
-define('CD_RECIPIENT', 'TN9sBCbSbd4LSmEa9xJfTJJLVLWFyo4p4Y');
-define('CD_USDT_TRC20', 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t');
-define('CD_BEP20_RECIPIENT', '0x85a5892979b85c28b49826703b75914be8022714'); // EVM twin of CD_RECIPIENT (same private key controls both)
-define('CD_USDT_BEP20', '0x55d398326f99059ff775485246999027b3197955');
-define('CD_BSC_RPC', 'https://bsc-dataseed.binance.org/');
-define('CD_ERC20_TRANSFER_TOPIC', '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef');
+const CD_RECIPIENT_TRC20 = 'TN9sBCbSbd4LSmEa9xJfTJJLVLWFyo4p4Y';
+const CD_USDT_TRC20 = 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t';
+const CD_RECIPIENT_BEP20 = '0x85a5892979b85c28b49826703b75914be8022714';
+const CD_USDT_BEP20 = '0x55d398326f99059ff775485246999027b3197955';
+const CD_BSC_RPC = 'https://bsc-dataseed.binance.org/';
+const CD_TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
 
 header('Content-Type: application/json; charset=utf-8');
-header('Cache-Control: no-store');
+header('Cache-Control: no-store, no-cache, must-revalidate');
 
-function cd_fail(string $message, int $status = 400, array $extra = []): never
-{
+function cd_json(array $data, int $status = 200): never {
     http_response_code($status);
-    echo json_encode(['ok' => false, 'error' => $message, ...$extra], JSON_UNESCAPED_SLASHES);
+    echo json_encode($data, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
     exit;
 }
-
-if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'POST') {
-    cd_fail('Method not allowed', 405);
+function cd_fail(string $message, int $status = 400, array $extra = []): never {
+    cd_json(array_merge(['ok'=>false,'error'=>$message], $extra), $status);
 }
 
-$raw  = file_get_contents('php://input') ?: '';
+if (($_SERVER['REQUEST_METHOD'] ?? '') !== 'POST') cd_fail('Method not allowed', 405);
+
+$raw = file_get_contents('php://input') ?: '';
 $body = json_decode($raw, true);
-if (!is_array($body)) {
-    cd_fail('Invalid JSON body');
-}
+if (!is_array($body)) cd_fail('Invalid JSON body.');
 
 $productId = trim((string)($body['product_id'] ?? ''));
-$txHash    = trim((string)($body['tx_hash'] ?? ''));
-$network   = strtoupper(trim((string)($body['network'] ?? '')));
-$sender    = trim((string)($body['sender'] ?? ''));
+$txHash = trim((string)($body['tx_hash'] ?? ''));
+$network = strtoupper(trim((string)($body['network'] ?? '')));
+$sender = trim((string)($body['sender'] ?? ''));
 
-if ($productId === '' || $txHash === '') {
-    cd_fail('product_id and tx_hash are required');
+if ($productId === '' || $txHash === '') cd_fail('product_id and tx_hash are required.');
+if (!in_array($network, ['TRC20','BEP20'], true)) cd_fail('network must be TRC20 or BEP20.');
+if (!preg_match('/^[0-9a-fA-F]{64}$/', $network === 'TRC20' ? $txHash : ltrim($txHash, '0x'))) {
+    cd_fail('Invalid transaction hash.');
 }
-
-if (!in_array($network, ['TRC20', 'BEP20'], true)) {
-    cd_fail('network must be TRC20 or BEP20');
-}
-
-// Transaction hash formats: TRON = 64 hex chars, EVM = 66 hex chars (0x…)
-if (!preg_match('/^(0x)?[0-9a-fA-F]{64}$/', $txHash)) {
-    cd_fail('Invalid transaction hash');
-}
-
-if ($network === 'TRC20' && str_starts_with($txHash, '0x')) {
-    cd_fail('TRC20 transaction hashes do not start with 0x');
-}
-if ($network === 'BEP20' && !str_starts_with($txHash, '0x')) {
-    cd_fail('BEP20 transaction hashes must start with 0x');
-}
+if ($network === 'BEP20' && !preg_match('/^0x[0-9a-fA-F]{64}$/', $txHash)) cd_fail('BEP20 transaction hash must start with 0x.');
+if ($network === 'TRC20' && str_starts_with($txHash, '0x')) cd_fail('TRC20 transaction hash must not start with 0x.');
 
 $product = cd_product($productId);
-if ($product === null) {
-    cd_fail('Unknown product', 404);
+if (!$product) cd_fail('Unknown product.', 404);
+
+try {
+    $check = $network === 'TRC20'
+        ? cd_verify_trc20($txHash, $product)
+        : cd_verify_bep20($txHash, $product);
+} catch (Throwable $e) {
+    error_log('Payment verification error: ' . $e->getMessage());
+    cd_fail('Payment verification service is temporarily unavailable. Please try again.', 503, ['retryable'=>true]);
 }
 
-$verified  = 0;
-$degraded  = false; // true => explorer unreachable, logged but unverified
-$amount    = 0.0;
-$recipient = '';
-
-if ($network === 'TRC20') {
-    $check = cd_verify_trc20($txHash, $product);
-} else {
-    $check = cd_verify_bep20($txHash, $product);
+if (!$check['ok']) {
+    $retryable = in_array($check['reason'] ?? '', ['tx_not_found','not_confirmed_yet','rpc_unreachable'], true);
+    cd_fail('Payment could not be verified: ' . ($check['reason'] ?? 'unknown'), $retryable ? 422 : 422, ['retryable'=>$retryable]);
 }
 
-if ($check['ok']) {
-    $verified  = 1;
-    $amount    = $check['amount'];
-    $recipient = $check['recipient'];
-    if ($sender !== '' && strcasecmp($sender, $check['sender']) !== 0) {
-        cd_fail('Transaction sender does not match the paying wallet');
-    }
-} elseif (($check['reason'] ?? '') === 'rpc_unreachable') {
-    // Explorer down: accept (the browser confirmed on-chain) but flag it.
-    $degraded = true;
+$normalizedTx = strtolower($txHash);
+$pdo = cd_db();
+
+/* Never release a product unless this exact transaction has passed server verification. */
+$stmt = $pdo->prepare('SELECT * FROM orders WHERE network = :network AND tx_hash = :tx LIMIT 1');
+$stmt->execute([':network'=>$network, ':tx'=>$normalizedTx]);
+$existing = $stmt->fetch();
+
+if ($existing) {
+    if ((string)$existing['product_id'] !== $productId) cd_fail('This transaction was already used for another product.', 409);
+    if ((int)$existing['verified'] !== 1) cd_fail('Payment is not verified yet.', 409, ['retryable'=>true]);
+    $amount = (float)$existing['amount'];
 } else {
-    cd_fail('Payment could not be verified on-chain: ' . ($check['reason'] ?? 'unknown'), 422, [
-        'retryable' => in_array($check['reason'] ?? '', ['tx_not_found', 'not_confirmed_yet'], true),
+    $stmt = $pdo->prepare('INSERT INTO orders
+        (product_id,network,tx_hash,sender,recipient,amount,verified,created_at)
+        VALUES (:product_id,:network,:tx,:sender,:recipient,:amount,1,:created_at)');
+    $stmt->execute([
+        ':product_id'=>$productId,
+        ':network'=>$network,
+        ':tx'=>$normalizedTx,
+        ':sender'=>$check['sender'],
+        ':recipient'=>$check['recipient'],
+        ':amount'=>$check['amount'],
+        ':created_at'=>time(),
     ]);
+    $amount = $check['amount'];
 }
 
-// Idempotent insert on tx_hash — a replay simply returns the file link again.
-// A degraded (unverified) order upgrades to verified if the tx later verifies.
-$stmt = cd_db()->prepare('
-    INSERT INTO orders (product_id, network, tx_hash, sender, recipient, amount, verified, created_at)
-    VALUES (:product_id, :network, :tx_hash, :sender, :recipient, :amount, :verified, :created_at)
-    ON CONFLICT(tx_hash) DO UPDATE SET
-        product_id = excluded.product_id,
-        verified   = max(orders.verified, excluded.verified),
-        amount     = CASE WHEN excluded.verified = 1 THEN excluded.amount ELSE orders.amount END
-');
-$stmt->execute([
-    ':product_id' => $productId,
-    ':network'    => $network,
-    ':tx_hash'    => strtolower($txHash),
-    ':sender'     => $sender,
-    ':recipient'  => $recipient ?: ($product['wallet'] ?? ''),
-    ':amount'     => $amount > 0 ? $amount : (float)$product['price'],
-    ':verified'   => $verified,
-    ':created_at' => time(),
+cd_json([
+    'ok'=>true,
+    'verified'=>true,
+    'product'=>$product['name'],
+    'file'=>$product['file'],
+    'amount'=>$amount,
+    'tx_hash'=>$normalizedTx,
+    'network'=>$network,
+    'explorer'=>$network === 'TRC20'
+        ? 'https://tronscan.org/#/transaction/'.$normalizedTx
+        : 'https://bscscan.com/tx/'.$normalizedTx,
 ]);
 
-echo json_encode([
-    'ok'         => true,
-    'verified'   => (bool)$verified,
-    'degraded'   => $degraded,
-    'product'    => $product['name'],
-    'file'       => $product['file'],
-    'tx_hash'    => $txHash,
-    'network'    => $network,
-    'explorer'   => $network === 'TRC20'
-        ? 'https://tronscan.org/#/transaction/' . $txHash
-        : 'https://bscscan.com/tx/' . $txHash,
-], JSON_UNESCAPED_SLASHES);
-
-/* ------------------------------------------------------------------
- * Verification helpers
- * ------------------------------------------------------------------ */
-
-/**
- * Verify a USDT TRC20 transfer through the public TronGrid API:
- * contract, selector, recipient, amount and sender are all checked.
- */
-function cd_verify_trc20(string $txHash, array $product): array
-{
-    $tx = cd_http_get_json('https://api.trongrid.io/wallet/gettransactionbyid?value=' . urlencode($txHash));
-    if ($tx === null) {
-        return ['ok' => false, 'reason' => 'rpc_unreachable'];
+function cd_http_json(string $url, string $method='GET', ?array $payload=null): array {
+    $ch = curl_init($url);
+    if ($ch === false) throw new RuntimeException('curl_init failed');
+    $headers = ['Accept: application/json'];
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER=>true,
+        CURLOPT_FOLLOWLOCATION=>false,
+        CURLOPT_CONNECTTIMEOUT=>5,
+        CURLOPT_TIMEOUT=>12,
+        CURLOPT_CUSTOMREQUEST=>$method,
+        CURLOPT_HTTPHEADER=>$headers,
+    ]);
+    if ($payload !== null) {
+        $json = json_encode($payload);
+        if ($json === false) throw new RuntimeException('JSON encoding failed');
+        curl_setopt($ch, CURLOPT_POSTFIELDS, $json);
+        $headers[] = 'Content-Type: application/json';
+        curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
     }
-    if (!is_array($tx) || empty($tx['txID'])) {
-        return ['ok' => false, 'reason' => 'tx_not_found'];
-    }
-
-    // A transaction can be broadcast yet still FAIL on-chain (OUT_OF_ENERGY,
-    // REVERT, …). The raw tx alone does not tell us — check the receipt.
-    $info = cd_http_get_json('https://api.trongrid.io/wallet/gettransactioninfobyid?value=' . urlencode($txHash));
-    if ($info === null) {
-        return ['ok' => false, 'reason' => 'rpc_unreachable'];
-    }
-    if (!is_array($info) || empty($info['id']) || empty($info['receipt'])) {
-        return ['ok' => false, 'reason' => 'not_confirmed_yet'];
-    }
-    if (($info['receipt']['result'] ?? '') !== 'SUCCESS') {
-        return ['ok' => false, 'reason' => 'tx_failed'];
-    }
-
-    $contract = $tx['raw_data']['contract'][0] ?? null;
-    if (($contract['type'] ?? '') !== 'TriggerSmartContract') {
-        return ['ok' => false, 'reason' => 'not_contract_call'];
-    }
-
-    $value = $contract['parameter']['value'] ?? [];
-    $data  = strtolower((string)($value['data'] ?? ''));
-
-    // transfer(address,uint256) selector + two 32-byte words
-    if (strlen($data) !== 136 || !str_starts_with($data, 'a9059cbb')) {
-        return ['ok' => false, 'reason' => 'not_trc20_transfer'];
-    }
-
-    $contractHex = (string)($value['contract_address'] ?? '');
-    if (cd_tron_base58check('41' . substr($contractHex, 2)) !== CD_USDT_TRC20) {
-        return ['ok' => false, 'reason' => 'wrong_contract'];
-    }
-
-    $recipientHex = '41' . substr(substr($data, 8, 64), 24);
-    $recipient    = cd_tron_base58check($recipientHex);
-    if ($recipient !== ($product['wallet'] ?: CD_RECIPIENT)) {
-        return ['ok' => false, 'reason' => 'wrong_recipient'];
-    }
-
-    $amountSmallest = cd_hex_to_dec(substr($data, 72, 64));
-    $amount         = (float)bcdiv($amountSmallest, '1000000', 6); // USDT has 6 decimals
-    if (bccomp($amountSmallest, cd_usdt_min_smallest((float)$product['price'], 6), 0) < 0) {
-        return ['ok' => false, 'reason' => 'underpaid'];
-    }
-
-    $sender = cd_tron_base58check('41' . substr((string)($value['owner_address'] ?? ''), 2));
-
-    return ['ok' => true, 'amount' => $amount, 'recipient' => $recipient, 'sender' => $sender];
-}
-
-/**
- * Verify a USDT BEP20 transfer through a public BSC RPC by parsing the
- * ERC-20 Transfer event log of the transaction receipt.
- */
-function cd_verify_bep20(string $txHash, array $product): array
-{
-    $receipt = cd_rpc_post(CD_BSC_RPC, 'eth_getTransactionReceipt', [$txHash]);
-    if ($receipt === null) {
-        return ['ok' => false, 'reason' => 'rpc_unreachable'];
-    }
-    if ($receipt === 'null') {
-        return ['ok' => false, 'reason' => 'tx_not_found'];
-    }
-
-    if (strtolower((string)($receipt['status'] ?? '')) !== '0x1') {
-        return ['ok' => false, 'reason' => 'tx_reverted'];
-    }
-
-    $expectedRecipient = strtolower(CD_BEP20_RECIPIENT);
-    $minSmallest       = cd_usdt_min_smallest((float)$product['price'], 18);
-
-    foreach ((array)($receipt['logs'] ?? []) as $log) {
-        $logAddress = strtolower((string)($log['address'] ?? ''));
-        if ($logAddress !== strtolower(CD_USDT_BEP20)) {
-            continue;
-        }
-
-        $topics = (array)($log['topics'] ?? []);
-        if (count($topics) < 3 || strtolower($topics[0]) !== CD_ERC20_TRANSFER_TOPIC) {
-            continue;
-        }
-
-        $to = '0x' . substr(strtolower($topics[2]), -40);
-        if ($to !== $expectedRecipient) {
-            continue;
-        }
-
-        $value = cd_hex_to_dec(str_ireplace('0x', '', (string)($log['data'] ?? '0x0')));
-        if (bccomp($value, $minSmallest, 0) < 0) {
-            return ['ok' => false, 'reason' => 'underpaid'];
-        }
-
-        $sender = '0x' . substr(strtolower($topics[1]), -40);
-
-        return [
-            'ok'        => true,
-            'amount'    => (float)$product['price'],
-            'recipient' => $to,
-            'sender'    => $sender,
-        ];
-    }
-
-    return ['ok' => false, 'reason' => 'no_usdt_transfer_to_recipient'];
-}
-
-/* ------------------------------------------------------------------
- * HTTP helpers
- * ------------------------------------------------------------------ */
-
-/**
- * GET a JSON document; null when the request fails (treated as unreachable).
- */
-function cd_http_get_json(string $url): mixed
-{
-    $ctx = stream_context_create(['http' => [
-        'method'  => 'GET',
-        'timeout' => 8,
-        'header'  => "Accept: application/json\r\n",
-        'ignore_errors' => true,
-    ]]);
-
-    $raw = @file_get_contents($url, false, $ctx);
-    if ($raw === false) {
-        return null;
-    }
-
-    return json_decode($raw, true);
-}
-
-/**
- * JSON-RPC POST; null when the request fails, the decoded 'result' otherwise.
- */
-function cd_rpc_post(string $url, string $method, array $params): mixed
-{
-    $payload = json_encode(['jsonrpc' => '2.0', 'id' => 1, 'method' => $method, 'params' => $params]);
-    if ($payload === false) {
-        return null;
-    }
-
-    $ctx = stream_context_create(['http' => [
-        'method'  => 'POST',
-        'timeout' => 8,
-        'header'  => "Content-Type: application/json\r\nAccept: application/json\r\n",
-        'content' => $payload,
-        'ignore_errors' => true,
-    ]]);
-
-    $raw = @file_get_contents($url, false, $ctx);
-    if ($raw === false) {
-        return null;
-    }
-
+    $raw = curl_exec($ch);
+    $errno = curl_errno($ch);
+    $error = curl_error($ch);
+    $status = (int)curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+    curl_close($ch);
+    if ($raw === false || $errno !== 0) throw new RuntimeException('HTTP request failed: '.$error);
     $decoded = json_decode($raw, true);
-    return $decoded['result'] ?? null;
+    if (!is_array($decoded)) throw new RuntimeException('Invalid JSON response.');
+    return ['status'=>$status,'body'=>$decoded];
 }
 
-/* ------------------------------------------------------------------
- * Address encoding (TRON base58check) + bcmath bigint helpers
- * ------------------------------------------------------------------ */
+function cd_verify_trc20(string $txHash, array $product): array {
+    try {
+        $txRes = cd_http_json('https://api.trongrid.io/wallet/gettransactionbyid?value='.rawurlencode($txHash));
+        $tx = $txRes['body'];
+        if (empty($tx['txID'])) return ['ok'=>false,'reason'=>'tx_not_found'];
 
-/**
- * Minimal base58check encode for TRON addresses (hex including the 0x41 prefix byte).
- */
-function cd_tron_base58check(string $hexWith41): string
-{
-    if (str_starts_with($hexWith41, '0x')) {
-        $hexWith41 = substr($hexWith41, 2);
-    }
-    if (strlen($hexWith41) % 2 !== 0) {
-        return '';
-    }
+        $infoRes = cd_http_json('https://api.trongrid.io/wallet/gettransactioninfobyid?value='.rawurlencode($txHash));
+        $info = $infoRes['body'];
+        if (empty($info['id']) || empty($info['receipt'])) return ['ok'=>false,'reason'=>'not_confirmed_yet'];
+        if (($info['receipt']['result'] ?? '') !== 'SUCCESS') return ['ok'=>false,'reason'=>'tx_failed'];
 
-    $binary = hex2bin($hexWith41);
-    if ($binary === false) {
-        return '';
-    }
-    $checksum = substr(hash('sha256', hash('sha256', $binary, true), true), 0, 4);
+        $contract = $tx['raw_data']['contract'][0] ?? null;
+        if (($contract['type'] ?? '') !== 'TriggerSmartContract') return ['ok'=>false,'reason'=>'not_contract_call'];
+        $value = $contract['parameter']['value'] ?? [];
+        $data = strtolower((string)($value['data'] ?? ''));
+        if (!preg_match('/^a9059cbb[0-9a-f]{128}$/', $data)) return ['ok'=>false,'reason'=>'not_trc20_transfer'];
 
-    return cd_base58_encode($binary . $checksum);
+        $contractHex = strtolower(ltrim((string)($value['contract_address'] ?? ''), '0x'));
+        $expectedContractHex = strtolower(ltrim(cd_tron_to_hex(CD_USDT_TRC20), '0x'));
+        if ($contractHex !== $expectedContractHex) return ['ok'=>false,'reason'=>'wrong_contract'];
+
+        $recipient = cd_tron_base58check('41'.substr($data, 8+24, 40));
+        $expectedRecipient = (string)($product['wallet'] ?: CD_RECIPIENT_TRC20);
+        if ($recipient !== $expectedRecipient) return ['ok'=>false,'reason'=>'wrong_recipient'];
+
+        $amountSmallest = cd_hex_to_dec(substr($data, 72, 64));
+        $required = cd_usdt_smallest((string)$product['price'], 6);
+        if (bccomp($amountSmallest, $required, 0) < 0) return ['ok'=>false,'reason'=>'underpaid'];
+
+        $ownerHex = strtolower(ltrim((string)($value['owner_address'] ?? ''), '0x'));
+        $sender = cd_tron_base58check('41'.substr($ownerHex, -40));
+        return ['ok'=>true,'amount'=>(float)bcdiv($amountSmallest,'1000000',6),'recipient'=>$recipient,'sender'=>$sender];
+    } catch (Throwable $e) {
+        error_log('TRON verify: '.$e->getMessage());
+        return ['ok'=>false,'reason'=>'rpc_unreachable'];
+    }
 }
 
-function cd_base58_encode(string $bytes): string
-{
-    $alphabet = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
-    $n        = cd_hex_to_dec(bin2hex($bytes));
-    $out      = '';
+function cd_verify_bep20(string $txHash, array $product): array {
+    try {
+        $res = cd_http_json(CD_BSC_RPC, 'POST', ['jsonrpc'=>'2.0','id'=>1,'method'=>'eth_getTransactionReceipt','params'=>[$txHash]]);
+        $receipt = $res['body']['result'] ?? null;
+        if ($receipt === null) return ['ok'=>false,'reason'=>'tx_not_found'];
+        if (strtolower((string)($receipt['status'] ?? '')) !== '0x1') return ['ok'=>false,'reason'=>'tx_reverted'];
 
-    while (bccomp($n, '0', 0) > 0) {
-        $r   = bcmod($n, '58');
-        $n   = bcdiv($n, '58', 0);
-        $out = $alphabet[(int)$r] . $out;
-    }
+        $expectedRecipient = strtolower(CD_RECIPIENT_BEP20);
+        $required = cd_usdt_smallest((string)$product['price'], 18);
 
-    // Leading zero bytes become '1'
-    foreach (str_split($bytes) as $byte) {
-        if ($byte !== "\x00") {
-            break;
+        foreach ((array)($receipt['logs'] ?? []) as $log) {
+            if (strtolower((string)($log['address'] ?? '')) !== strtolower(CD_USDT_BEP20)) continue;
+            $topics = $log['topics'] ?? [];
+            if (count($topics) < 3 || strtolower((string)$topics[0]) !== CD_TRANSFER_TOPIC) continue;
+            $to = '0x'.substr(strtolower((string)$topics[2]), -40);
+            if ($to !== $expectedRecipient) continue;
+            $valueHex = preg_replace('/^0x/i','',(string)($log['data'] ?? '0x0'));
+            $value = cd_hex_to_dec($valueHex);
+            if (bccomp($value,$required,0) < 0) return ['ok'=>false,'reason'=>'underpaid'];
+            $sender = '0x'.substr(strtolower((string)$topics[1]), -40);
+            return ['ok'=>true,'amount'=>(float)bcdiv($value,bcpow('10','18',0),18),'recipient'=>$to,'sender'=>$sender];
         }
-        $out = '1' . $out;
+        return ['ok'=>false,'reason'=>'no_usdt_transfer_to_recipient'];
+    } catch (Throwable $e) {
+        error_log('BSC verify: '.$e->getMessage());
+        return ['ok'=>false,'reason'=>'rpc_unreachable'];
     }
-
-    return $out;
 }
 
-/**
- * Arbitrary-precision hex → decimal (bcmath, since gmp is unavailable).
- */
-function cd_hex_to_dec(string $hex): string
-{
-    $hex = strtolower(str_ireplace('0x', '', $hex));
-    $dec = '0';
-    foreach (str_split($hex) as $char) {
-        $dec = bcadd(bcmul($dec, '16', 0), (string)hexdec($char), 0);
-    }
+function cd_usdt_smallest(string $price, int $decimals): string {
+    if (!preg_match('/^\d+(?:\.\d+)?$/', $price)) throw new InvalidArgumentException('Invalid price');
+    [$whole,$fraction] = array_pad(explode('.',$price,2),2,'');
+    if (strlen($fraction)>$decimals) $fraction=substr($fraction,0,$decimals);
+    return bcadd(bcmul($whole,bcpow('10',(string)$decimals,0),0),str_pad($fraction,$decimals,'0'),0);
+}
+function cd_hex_to_dec(string $hex): string {
+    $hex = preg_replace('/^0x/i','',$hex);
+    $dec='0';
+    foreach (str_split(strtolower($hex)) as $c) $dec=bcadd(bcmul($dec,'16',0),(string)hexdec($c),0);
     return $dec;
 }
-
-/**
- * Smallest-unit amount representing a product price (e.g. 299 USDT @ 6 decimals).
- */
-function cd_usdt_min_smallest(float $price, int $decimals): string
-{
-    return bcmul((string)(int)ceil($price), bcpow('10', (string)$decimals, 0), 0);
+function cd_tron_to_hex(string $base58): string {
+    $bytes=cd_base58_decode($base58);
+    return bin2hex(substr($bytes,0,21));
+}
+function cd_base58_decode(string $input): string {
+    $alphabet='123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+    $n='0';
+    foreach (str_split($input) as $char) {
+        $pos=strpos($alphabet,$char); if($pos===false) throw new InvalidArgumentException('Invalid Base58');
+        $n=bcadd(bcmul($n,'58',0),(string)$pos,0);
+    }
+    $hex='';
+    while (bccomp($n,'0',0)>0) { $r=(int)bcmod($n,'256'); $n=bcdiv($n,'256',0); $hex=str_pad(dechex($r),2,'0',STR_PAD_LEFT).$hex; }
+    $leading=0; for($i=0;$i<strlen($input)&&$input[$i]==='1';$i++)$leading++;
+    return str_repeat("\0",$leading).($hex!==''?hex2bin($hex):'');
+}
+function cd_tron_base58check(string $hex): string {
+    $hex=preg_replace('/^0x/i','',$hex); if(strlen($hex)%2!==0) return '';
+    $binary=hex2bin($hex); if($binary===false) return '';
+    $checksum=substr(hash('sha256',hash('sha256',$binary,true),true),0,4);
+    return cd_base58_encode($binary.$checksum);
+}
+function cd_base58_encode(string $bytes): string {
+    $alphabet='123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+    $n=cd_hex_to_dec(bin2hex($bytes)); $out='';
+    while(bccomp($n,'0',0)>0){$r=(int)bcmod($n,'58');$n=bcdiv($n,'58',0);$out=$alphabet[$r].$out;}
+    for($i=0;$i<strlen($bytes)&&$bytes[$i]==="\0";$i++)$out='1'.$out;
+    return $out;
 }
