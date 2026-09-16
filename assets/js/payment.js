@@ -111,7 +111,7 @@ class CryptoPayment {
             ➕ More Wallets
           </button>
 
-          <div id="walletStatus"></div>
+          <div id="walletConnectionStatus"></div>
         </div>
       </div>
     `;
@@ -176,7 +176,7 @@ class CryptoPayment {
           cursor: pointer;
           line-height: 1;
         }
-        #walletSelector #walletStatus {
+        #walletSelector #walletConnectionStatus {
           margin-top: 14px;
           text-align: center;
           color: #666;
@@ -383,7 +383,7 @@ class CryptoPayment {
   }
 
   showWalletStatus(message) {
-    const status = document.getElementById("walletStatus");
+    const status = document.getElementById("walletConnectionStatus");
     if (status) status.textContent = message;
   }
 
@@ -541,8 +541,9 @@ class CryptoPayment {
     const actualAmount = BigInt("0x" + encodedAmount);
     const expectedAmountSmallest = this.toSmallestUnit(expectedAmount, decimals);
 
-    if (actualAmount !== expectedAmountSmallest) {
-      throw new Error("USDT amount does not match.");
+    // Overpayment still pays the store — only underpayment is rejected.
+    if (actualAmount < expectedAmountSmallest) {
+      throw new Error("USDT amount is less than the required price.");
     }
 
     const actualSender = this.tronWeb.address.fromHex(value.owner_address);
